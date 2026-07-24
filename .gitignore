@@ -1,3 +1,4 @@
 /.venv
 /checkpoints
 /data
+/scripts/__pycache__
