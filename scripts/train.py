@@ -51,15 +51,20 @@ def main():
     val_ds = NNUEDataset(args.val)
     print(f"Train positions: {len(train_ds)}  Val positions: {len(val_ds)}")
 
+    print("Loading train data...")
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
+    print("Loaded train data...")
+
+    print("Loading val data...")
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers,
     )
+    print("Loaded val data...")
 
     model = NNUE().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -67,7 +72,7 @@ def main():
     loss_fn = nn.MSELoss()
 
     best_val = float("inf")
-
+    print("Training...")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         running = 0.0
