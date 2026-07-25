@@ -13,12 +13,36 @@ It writes:
     data/val.bin
 
 Each record is 68 bytes (see fen_utils.py for the exact layout).
+
+Perf design
+-----------
+Reading rows out of the HF streaming dataset is inherently single-threaded
+(it's one network-backed generator) -- that part can't be parallelized.
+What *can* be parallelized is the CPU-bound work per row: FEN parsing and
+struct packing. So:
+
+  - The main process just pulls rows off the stream, filters them
+    (cheap), and groups them into batches.
+  - Batches are handed to a ProcessPoolExecutor. Workers do the actual
+    fen->bytes parsing (the expensive part) and also decide, using a
+    worker-local RNG, which records *would* go to val vs train -- this
+    keeps the workers independent instead of needing a shared counter.
+  - The main process keeps a bounded number of batches in flight (not
+    executor.map, which submits every batch up front and would force
+    the entire streaming read to finish before any work is returned --
+    killing the overlap between network I/O and CPU work). This way
+    downloading batch N+1 happens while batch N is being parsed on
+    another core.
+  - Results are appended into growable bytearrays and flushed to disk
+    in large chunks instead of one write() per record.
 """
 
 import argparse
 import os
 import random
 import time
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 
 from fen_utils import pack_record, RECORD_SIZE
 
@@ -28,6 +52,9 @@ try:
 except ImportError:
     HAVE_TQDM = False
 
+VAL_FRACTION = 0.006  # matches the original sampling rate for the val split
+FLUSH_BYTES = 4 * 1024 * 1024  # flush each output file every ~4MB
+
 
 def iter_filtered_rows(min_depth: int, max_abs_cp: int, keep_mate: bool):
     from datasets import load_dataset
@@ -36,7 +63,6 @@ def iter_filtered_rows(min_depth: int, max_abs_cp: int, keep_mate: bool):
         "Lichess/chess-position-evaluations", split="train", streaming=True
     )
 
-    # ds = ds.shuffle(seed=2312,buffer_size=100_000)
     for row in ds:
         if row["depth"] is not None and row["depth"] < min_depth:
             continue
@@ -55,6 +81,25 @@ def iter_filtered_rows(min_depth: int, max_abs_cp: int, keep_mate: bool):
         yield row["fen"], cp, mate
 
 
+def batched(iterable, n):
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def process_batch(batch, seed):
+    """Worker function: pack every row in the batch and tag each record
+    with a worker-local random draw the main process uses to route it to
+    train or val. Runs in a separate process."""
+    rng = random.Random(seed)
+    return [(pack_record(fen, cp, mate), rng.random()) for fen, cp, mate in batch]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="../data")
@@ -65,15 +110,22 @@ def main():
     ap.add_argument("--keep-mate", action="store_true",
                      help="Include forced-mate rows (stored as +/-3000cp).")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--workers", type=int, default=os.cpu_count(),
+                     help="Number of worker processes for FEN parsing/packing.")
+    ap.add_argument("--batch-size", type=int, default=2000,
+                     help="Rows per unit of work handed to a worker process.")
+    ap.add_argument("--max-in-flight", type=int, default=None,
+                     help="Max batches queued/running at once "
+                          "(default: 4x --workers).")
     ap.add_argument("--progress-every", type=int, default=50_000,
                      help="If tqdm isn't installed, print a status line "
                           "every N rows scanned.")
     args = ap.parse_args()
 
-    random.seed(args.seed)
+    if args.max_in_flight is None:
+        args.max_in_flight = max(4, args.workers * 4)
 
     os.makedirs(args.out_dir, exist_ok=True)
-
     train_path = f"{args.out_dir}/train.bin"
     val_path = f"{args.out_dir}/val.bin"
 
@@ -82,39 +134,73 @@ def main():
     n_scanned = 0
     start = time.time()
 
-    # Progress bar tracks n_train_written against the requested target,
-    # since that's the dominant stopping condition and gives a real ETA.
-    # n_scanned (rows pulled from the stream, including filtered-out ones)
-    # is shown in the postfix so you can see the filter's reject rate.
     pbar = tqdm(total=args.n_train, unit="rec", desc="train") if HAVE_TQDM else None
 
-    with open(train_path, "wb") as f_train, open(val_path, "wb") as f_val:
-        for fen, cp, mate in iter_filtered_rows(
-            args.min_depth, args.max_abs_cp, args.keep_mate
-        ):
-            n_scanned += 1
+    row_iter = iter_filtered_rows(args.min_depth, args.max_abs_cp, args.keep_mate)
+    batch_iter = batched(row_iter, args.batch_size)
 
-            if n_train_written >= args.n_train and n_val_written >= args.n_val:
-                break
+    with ProcessPoolExecutor(max_workers=args.workers) as ex, \
+         open(train_path, "wb") as f_train, \
+         open(val_path, "wb") as f_val:
 
-            record = pack_record(fen, cp, mate)
-            # ~0.6% of rows go to validation until it's full
-            if n_val_written < args.n_val and random.random() < 0.006:
-                f_val.write(record)
-                n_val_written += 1
-            elif n_train_written < args.n_train:
-                f_train.write(record)
-                n_train_written += 1
-                if pbar is not None:
-                    pbar.update(1)
-                    if n_train_written % 1000 == 0:
-                        pbar.set_postfix(
-                            val=f"{n_val_written}/{args.n_val}",
-                            scanned=n_scanned,
-                            refresh=False,
-                        )
+        futures = deque()
+        next_batch_id = 0
+        stream_exhausted = False
 
-            if pbar is None and n_scanned % args.progress_every == 0:
+        def submit_next():
+            nonlocal next_batch_id, stream_exhausted
+            if stream_exhausted:
+                return
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                stream_exhausted = True
+                return
+            futures.append(
+                ex.submit(process_batch, batch, args.seed + next_batch_id)
+            )
+            next_batch_id += 1
+
+        # prime the pipeline
+        for _ in range(args.max_in_flight):
+            submit_next()
+
+        train_buf = bytearray()
+        val_buf = bytearray()
+        done = False
+
+        while futures and not done:
+            fut = futures.popleft()
+            for record, r in fut.result():
+                n_scanned += 1
+                if n_val_written < args.n_val and r < VAL_FRACTION:
+                    val_buf += record
+                    n_val_written += 1
+                elif n_train_written < args.n_train:
+                    train_buf += record
+                    n_train_written += 1
+                    if pbar is not None:
+                        pbar.update(1)
+
+                if n_train_written >= args.n_train and n_val_written >= args.n_val:
+                    done = True
+                    break
+
+            if len(train_buf) >= FLUSH_BYTES:
+                f_train.write(train_buf)
+                train_buf.clear()
+            if len(val_buf) >= FLUSH_BYTES:
+                f_val.write(val_buf)
+                val_buf.clear()
+
+            if pbar is not None:
+                if n_train_written % 1000 == 0 or done:
+                    pbar.set_postfix(
+                        val=f"{n_val_written}/{args.n_val}",
+                        scanned=n_scanned,
+                        refresh=False,
+                    )
+            elif n_scanned % args.progress_every == 0:
                 elapsed = time.time() - start
                 rate = n_train_written / elapsed if elapsed > 0 else 0
                 remaining = args.n_train - n_train_written
@@ -127,6 +213,19 @@ def main():
                     f"eta={eta_s/60:,.1f} min",
                     flush=True,
                 )
+
+            if not done:
+                submit_next()
+
+        # final flush
+        if train_buf:
+            f_train.write(train_buf)
+        if val_buf:
+            f_val.write(val_buf)
+
+        # if we stopped early, drop any still-pending/running work
+        if futures:
+            ex.shutdown(wait=False, cancel_futures=True)
 
     if pbar is not None:
         pbar.close()

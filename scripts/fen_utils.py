@@ -20,6 +20,13 @@ Board encoding used everywhere in this project (68-byte training record):
 This mirrors the fields in the Lichess/chess-position-evaluations dataset:
   fen, line, depth, knodes, cp, mate
 We only use fen, cp and mate here.
+
+Perf notes (this file is on the hot path -- called once per row, millions
+of times, during data prep):
+  - fen_to_board_and_stm() parses the placement field in a single pass
+    with no fen.split() list allocation and no isdigit()/int() calls.
+  - pack_record() builds the board directly and hands it straight to
+    struct.pack without an intermediate 65-byte slice-and-reslice.
 """
 
 import struct
@@ -32,14 +39,25 @@ PIECE_CODE = {
 RECORD_STRUCT = struct.Struct("<64sBhB")  # 64 bytes, 1 byte, int16, 1 byte
 RECORD_SIZE = RECORD_STRUCT.size  # 68
 
+_pack = RECORD_STRUCT.pack
+_unpack = RECORD_STRUCT.unpack
 
-def fen_to_board_bytes(fen: str) -> bytes:
-    """Convert the piece-placement + side-to-move part of a FEN into the
-    64-byte board array described above. Only needs the first two
-    space-separated fields of the FEN."""
-    parts = fen.split()
-    placement = parts[0]
-    stm = parts[1] if len(parts) > 1 else "w"
+
+def fen_to_board_and_stm(fen: str):
+    """Parse the piece-placement + side-to-move fields of a FEN.
+
+    Returns (board: bytearray[64], stm: int) where stm is 0 for white,
+    1 for black. This is the fast core parser; fen_to_board_bytes() below
+    is kept only for backwards compatibility with old callers.
+    """
+    space = fen.find(" ")
+    if space == -1:
+        placement = fen
+        stm = 0
+    else:
+        placement = fen[:space]
+        # side-to-move is the single character right after the first space
+        stm = 0 if (len(fen) <= space + 1 or fen[space + 1] == "w") else 1
 
     board = bytearray(64)
     rank = 7  # FEN starts at rank 8 (index 7)
@@ -48,14 +66,21 @@ def fen_to_board_bytes(fen: str) -> bytes:
         if ch == "/":
             rank -= 1
             file = 0
-        elif ch.isdigit():
-            file += int(ch)
+        elif "1" <= ch <= "8":
+            file += ord(ch) - 48  # faster than int(ch)
         else:
-            sq = rank * 8 + file
-            board[sq] = PIECE_CODE[ch]
+            board[rank * 8 + file] = PIECE_CODE[ch]
             file += 1
 
-    board.append(0 if stm == "w" else 1)
+    return board, stm
+
+
+def fen_to_board_bytes(fen: str) -> bytes:
+    """Legacy API: 65-byte blob (64 board bytes + stm byte). Prefer
+    fen_to_board_and_stm() in new code -- this just wraps it for anything
+    still importing the old signature."""
+    board, stm = fen_to_board_and_stm(fen)
+    board.append(stm)
     return bytes(board)
 
 
@@ -64,24 +89,22 @@ def pack_record(fen: str, cp, mate) -> bytes:
     cp: int or None. mate: int or None (plies to mate, sign = side that mates).
     Eval is always stored from WHITE's perspective.
     """
-    board_and_stm = fen_to_board_bytes(fen)
-    board = board_and_stm[:64]
-    stm = board_and_stm[64]
+    board, stm = fen_to_board_and_stm(fen)
 
-    is_mate = 0
     if mate is not None:
         is_mate = 1
         eval_cp = 3000 if mate > 0 else -3000
     else:
+        is_mate = 0
         eval_cp = int(cp)
         if eval_cp > 3000:
             eval_cp = 3000
         elif eval_cp < -3000:
             eval_cp = -3000
 
-    return RECORD_STRUCT.pack(board, stm, eval_cp, is_mate)
+    return _pack(bytes(board), stm, eval_cp, is_mate)
 
 
 def unpack_record(record: bytes):
-    board, stm, eval_cp, is_mate = RECORD_STRUCT.unpack(record)
+    board, stm, eval_cp, is_mate = _unpack(record)
     return board, stm, eval_cp, bool(is_mate)
