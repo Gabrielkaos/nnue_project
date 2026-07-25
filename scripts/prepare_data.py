@@ -36,7 +36,7 @@ def iter_filtered_rows(min_depth: int, max_abs_cp: int, keep_mate: bool):
         "Lichess/chess-position-evaluations", split="train", streaming=True
     )
 
-    ds = ds.shuffle(seed=2312,buffer_size=100_000)
+    # ds = ds.shuffle(seed=2312,buffer_size=100_000)
     for row in ds:
         if row["depth"] is not None and row["depth"] < min_depth:
             continue
