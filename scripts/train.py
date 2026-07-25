@@ -88,6 +88,8 @@ def main():
                      help="Wrap the model in torch.compile() (PyTorch 2.x). "
                           "Helps most when the GPU is the bottleneck; won't "
                           "fix a data-loading-bound pipeline.")
+    ap.add_argument("--resume", type=str, default=None,
+                help="Checkpoint to resume training from")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,7 +128,7 @@ def main():
     )
     print("Loaded val data...")
 
-    model = NNUE().to(device)
+    model = NNUE()
     print(f"model size:\ninput={model.input_size}\nl1={model.l1_size}\nl2={model.l2_size}\nl3={model.l3_size}")
 
     if args.compile:
@@ -146,8 +148,27 @@ def main():
     n_batches = len(train_loader)
 
     best_val = float("inf")
+
+    if args.resume:
+        print(f"Loading checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+
+        model.load_state_dict(checkpoint["model"])
+
+        if "optimizer" in checkpoint:
+            opt.load_state_dict(checkpoint["optimizer"])
+
+        if "scheduler" in checkpoint:
+            sched.load_state_dict(checkpoint["scheduler"])
+
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        best_val = checkpoint.get("val_mse", float("inf"))
+
+    model = model.to(device)
+    model.train()
+
     print("Training...")
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         # Accumulated on-device; only pulled to CPU every --log-every steps
         # (and at epoch end) to avoid a sync on every single batch.
@@ -226,13 +247,13 @@ def main():
         state_dict = getattr(model, "_orig_mod", model).state_dict()
 
         torch.save(
-            {"model": state_dict, "val_mse": val_loss, "epoch": epoch},
+            {"model": state_dict, "val_mse": val_loss, "epoch": epoch, "optimizer":opt.state_dict(), "scheduler":sched.state_dict()},
             args.out_last,
         )
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save({"model": state_dict, "val_mse": val_loss}, args.out)
+            torch.save({"model": state_dict, "val_mse": val_loss, "optimizer":opt.state_dict(), "scheduler":sched.state_dict()}, args.out)
             print(f"  -> saved new best checkpoint to {args.out}")
 
     print("Done. Best val MSE:", best_val)

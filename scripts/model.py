@@ -24,7 +24,7 @@ class ClippedReLU(nn.Module):
 
 
 class NNUE(nn.Module):
-    def __init__(self, input_size=768, l1=512, l2=32, l3=32):
+    def __init__(self, input_size=768, l1=512, l2=64, l3=32):
         super().__init__()
         self.input_size = input_size
         self.l1_size = l1
