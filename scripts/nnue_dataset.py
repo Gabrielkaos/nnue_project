@@ -24,6 +24,31 @@ Note: because there's no side-to-move signal anywhere in the features,
 the net can't learn tempo-type effects (a small bonus for "it's my move").
 That's an intentional simplicity/speed trade-off — your classical eval
 already adds its own explicit `tempo` bonus on top separately.
+
+Perf notes
+----------
+This is the actual bottleneck in the training pipeline: with a tiny NNUE
+model, the GPU finishes a batch almost instantly, so throughput is set
+entirely by how fast the CPU can hand over batches. The original
+__getitem__ built one 768-float feature vector at a time with a Python
+`for sq in nz: ...` loop -- called once per training sample, i.e. millions
+of times per epoch, each doing several small numpy calls whose per-call
+overhead dominates over the actual (tiny) amount of work being done.
+
+The fix is __getitems__ (note the plural): PyTorch's DataLoader fetcher
+checks for this method and, if present, calls it once per *batch* with the
+whole list of indices instead of calling __getitem__ once per sample. That
+turns "N python-level numpy calls" into "N/batch_size python-level numpy
+calls", with the actual feature construction done as a single vectorized
+scatter over the whole batch. Nothing else about how you use NNUEDataset
+or DataLoader needs to change -- shuffling, num_workers, collation into
+(x, y) batch tensors, all of it stays exactly as before, this just changes
+how the data underneath gets built.
+
+Requires torch >= 2.0 (older torch DataLoader fetchers ignore
+__getitems__ and silently fall back to the slow per-sample path via
+__getitem__, which is kept below for that fallback and for any code that
+indexes the dataset directly, e.g. dataset[i] in a REPL).
 """
 
 import numpy as np
@@ -33,6 +58,21 @@ from torch.utils.data import Dataset
 from fen_utils import RECORD_SIZE
 
 CP_SCALE = 410.0
+
+# Structured view of the 68-byte record so field extraction is a plain
+# strided numpy read instead of manual byte-shift arithmetic. '<i2' is
+# explicit little-endian int16 to match struct.Struct("<64sBhB") in
+# fen_utils.py regardless of host byte order.
+RECORD_DTYPE = np.dtype([
+    ("board", np.uint8, (64,)),
+    ("stm", np.uint8),
+    ("eval", "<i2"),
+    ("flags", np.uint8),
+])
+assert RECORD_DTYPE.itemsize == RECORD_SIZE, (
+    f"RECORD_DTYPE size {RECORD_DTYPE.itemsize} != RECORD_SIZE {RECORD_SIZE}; "
+    "keep this in sync with fen_utils.RECORD_STRUCT"
+)
 
 
 class NNUEDataset(Dataset):
@@ -49,29 +89,55 @@ class NNUEDataset(Dataset):
     def _ensure_mmap(self):
         if self._mmap is None:
             self._mmap = np.memmap(
-                self.path, dtype=np.uint8, mode="r", shape=(self.n, RECORD_SIZE)
+                self.path, dtype=RECORD_DTYPE, mode="r", shape=(self.n,)
             )
 
     def __len__(self):
         return self.n
 
+    @staticmethod
+    def _boards_to_features(boards: np.ndarray) -> np.ndarray:
+        """Vectorized board(s) -> one-hot 768-feature array. boards can be
+        shape (64,) for a single position or (B, 64) for a batch; returns
+        shape (768,) or (B, 768) to match."""
+        single = boards.ndim == 1
+        if single:
+            boards = boards[None, :]
+
+        rows, cols = np.nonzero(boards)
+        pieces = boards[rows, cols].astype(np.int64)
+        feat_idx = (pieces - 1) * 64 + cols  # plane*64 + square
+
+        features = np.zeros((boards.shape[0], 768), dtype=np.float32)
+        features[rows, feat_idx] = 1.0
+        return features[0] if single else features
+
+    def __getitems__(self, indices):
+        """Batch path -- used automatically by DataLoader when available
+        (torch >= 2.0). Does the whole batch's worth of work in one shot
+        with no Python-level loop over squares or samples."""
+        self._ensure_mmap()
+        idx = np.asarray(indices)
+        recs = self._mmap[idx]  # structured array, shape (B,)
+
+        features = self._boards_to_features(recs["board"])
+        cp_white = recs["eval"].astype(np.float32)
+        targets = 1.0 / (1.0 + np.exp(-cp_white / CP_SCALE))
+
+        feat_t = torch.from_numpy(features)
+        target_t = torch.from_numpy(targets)
+        # Split back into a list of (x, y) samples -- default_collate then
+        # stacks these into the same (B, 768) / (B,) batch tensors the
+        # training loop already expects. This is cheap: plain tensor
+        # views/slices, no per-element numpy work.
+        return list(zip(feat_t, target_t))
+
     def __getitem__(self, idx):
+        """Single-sample fallback: used if something indexes the dataset
+        directly, or on torch < 2.0 where __getitems__ isn't recognized."""
         self._ensure_mmap()
         rec = self._mmap[idx]
-        board = rec[:64]
-        # stm byte (rec[64]) is intentionally unused now: features are
-        # always absolute/White-fixed, regardless of whose move it is.
-        eval_raw = int(rec[65]) | (int(rec[66]) << 8)
-        if eval_raw >= 32768:
-            eval_raw -= 65536
-        cp_white = eval_raw
-
-        features = np.zeros(768, dtype=np.float32)
-        nz = np.nonzero(board)[0]
-        for sq in nz:
-            piece = int(board[sq])  # 1..12
-            plane = piece - 1  # 0..11
-            features[plane * 64 + sq] = 1.0
-
+        features = self._boards_to_features(rec["board"])
+        cp_white = float(rec["eval"])
         target = 1.0 / (1.0 + np.exp(-cp_white / CP_SCALE))
         return torch.from_numpy(features), torch.tensor(target, dtype=torch.float32)
