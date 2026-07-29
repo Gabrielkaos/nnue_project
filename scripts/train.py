@@ -75,6 +75,13 @@ def main():
                      help="Batches each worker prefetches ahead of time.")
     ap.add_argument("--out", default="../checkpoints/nnue.pt")
     ap.add_argument("--out-last", default="../checkpoints/last.pt")
+    ap.add_argument("--resume", default=None,
+                     help="Path to a checkpoint (e.g. --out-last from a "
+                          "previous run) to resume from: restores model "
+                          "weights, optimizer momentum, LR schedule "
+                          "position, and epoch count. Falls back to "
+                          "weights-only if the checkpoint predates this "
+                          "flag and has no optimizer/scheduler state.")
     ap.add_argument("--no-progress", action="store_true",
                      help="Disable the live per-batch progress bar.")
     ap.add_argument("--log-every", type=int, default=50,
@@ -88,8 +95,6 @@ def main():
                      help="Wrap the model in torch.compile() (PyTorch 2.x). "
                           "Helps most when the GPU is the bottleneck; won't "
                           "fix a data-loading-bound pipeline.")
-    ap.add_argument("--resume", type=str, default=None,
-                help="Checkpoint to resume training from")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -128,7 +133,7 @@ def main():
     )
     print("Loaded val data...")
 
-    model = NNUE()
+    model = NNUE().to(device)
     print(f"model size:\ninput={model.input_size}\nl1={model.l1_size}\nl2={model.l2_size}\nl3={model.l3_size}")
 
     if args.compile:
@@ -144,38 +149,60 @@ def main():
 
     scaler = torch.amp.GradScaler("cuda",enabled=(args.amp and device.type == "cuda"))
 
-    use_bar = HAVE_TQDM and not args.no_progress
-    n_batches = len(train_loader)
-
+    start_epoch = 1
     best_val = float("inf")
 
     if args.resume:
-        print(f"Loading checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
+        print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        print(f"checkpoint keys {ckpt.keys()}")
+        target_model = getattr(model, "_orig_mod", model)
+        target_model.load_state_dict(ckpt["model"])
 
-        print(checkpoint.keys())
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+            # Known PyTorch gotcha: load_state_dict doesn't always re-cast
+            # every tensor nested inside optimizer.state (Adam's exp_avg /
+            # exp_avg_sq momentum buffers) to the model's current device,
+            # even though torch.load already used map_location=device.
+            # Left uncorrected, this causes a silent CPU/CUDA mismatch that
+            # only surfaces later, on the first opt.step(). Force it here.
+            for state in opt.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(device)
+            print("Optimizer loaded")
+        else:
+            print("  checkpoint has no optimizer state -> Adam momentum "
+                  "resets (expect a small loss blip for a few batches)")
 
-        model.load_state_dict(checkpoint["model"])
-        print("Loaded checkpoint model")
+        if "scheduler" in ckpt:
+            sched.load_state_dict(ckpt["scheduler"])
+            print("Scheduler loaded")
+        else:
+            print("  checkpoint has no scheduler state -> LR schedule "
+                  "restarts from --lr")
 
-        if "optimizer" in checkpoint:
-            opt.load_state_dict(checkpoint["optimizer"])
-            print("Loaded checkpoint optimizer")
+        if scaler.is_enabled() and ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+            print("Scaler loaded")
 
-        if "scheduler" in checkpoint:
-            sched.load_state_dict(checkpoint["scheduler"])
-            print("Loaded checkpoint scheduler")
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_val = ckpt.get("val_mse", float("inf"))
+        print(f"  starting at epoch {start_epoch}, best_val so far "
+              f"{best_val:.6f}")
 
-        start_epoch = checkpoint.get("epoch", 0)
-        best_val = checkpoint.get("val_mse", float("inf"))
+    use_bar = HAVE_TQDM and not args.no_progress
+    n_batches = len(train_loader)
 
-        print(f"Start Epoch loaded:{start_epoch + 1}\nBest Val loaded:{best_val}")
-
-    model = model.to(device)
-    model.train()
+    if start_epoch > args.epochs:
+        print(f"Checkpoint is already at epoch {start_epoch - 1} >= "
+              f"--epochs {args.epochs}; nothing to do. Raise --epochs to "
+              f"train further.")
+        return
 
     print("Training...")
-    for epoch in range(start_epoch + 1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         # Accumulated on-device; only pulled to CPU every --log-every steps
         # (and at epoch end) to avoid a sync on every single batch.
@@ -253,24 +280,23 @@ def main():
         # checkpoint's state_dict keys match the plain NNUE module.
         state_dict = getattr(model, "_orig_mod", model).state_dict()
 
-        torch.save(
-            {"model": state_dict, 
-             "val_mse": val_loss, 
-             "epoch": epoch, 
-             "optimizer":opt.state_dict(), 
-             "scheduler":sched.state_dict()
-             },
-            args.out_last,
-        )
-
         if val_loss < best_val:
             best_val = val_loss
-            torch.save({"model": state_dict, 
-                        "epoch":epoch,
-                        "val_mse": val_loss, 
-                        "optimizer":opt.state_dict(), 
-                        "scheduler":sched.state_dict()
-                        }, args.out)
+
+        common_ckpt = {
+            "model": state_dict,
+            "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+            "val_mse": val_loss,
+            "epoch": epoch,
+            "best_val": best_val,
+        }
+
+        torch.save(common_ckpt, args.out_last)
+
+        if val_loss == best_val:
+            torch.save(common_ckpt, args.out)
             print(f"  -> saved new best checkpoint to {args.out}")
 
     print("Done. Best val MSE:", best_val)
