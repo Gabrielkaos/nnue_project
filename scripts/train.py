@@ -153,22 +153,29 @@ def main():
         print(f"Loading checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
 
+        print(checkpoint.keys())
+
         model.load_state_dict(checkpoint["model"])
+        print("Loaded checkpoint model")
 
         if "optimizer" in checkpoint:
             opt.load_state_dict(checkpoint["optimizer"])
+            print("Loaded checkpoint optimizer")
 
         if "scheduler" in checkpoint:
             sched.load_state_dict(checkpoint["scheduler"])
+            print("Loaded checkpoint scheduler")
 
-        start_epoch = checkpoint.get("epoch", 0) + 1
+        start_epoch = checkpoint.get("epoch", 0)
         best_val = checkpoint.get("val_mse", float("inf"))
+
+        print(f"Start Epoch loaded:{start_epoch + 1}\nBest Val loaded:{best_val}")
 
     model = model.to(device)
     model.train()
 
     print("Training...")
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         t0 = time.time()
         # Accumulated on-device; only pulled to CPU every --log-every steps
         # (and at epoch end) to avoid a sync on every single batch.
@@ -247,13 +254,23 @@ def main():
         state_dict = getattr(model, "_orig_mod", model).state_dict()
 
         torch.save(
-            {"model": state_dict, "val_mse": val_loss, "epoch": epoch, "optimizer":opt.state_dict(), "scheduler":sched.state_dict()},
+            {"model": state_dict, 
+             "val_mse": val_loss, 
+             "epoch": epoch, 
+             "optimizer":opt.state_dict(), 
+             "scheduler":sched.state_dict()
+             },
             args.out_last,
         )
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save({"model": state_dict, "val_mse": val_loss, "optimizer":opt.state_dict(), "scheduler":sched.state_dict()}, args.out)
+            torch.save({"model": state_dict, 
+                        "epoch":epoch,
+                        "val_mse": val_loss, 
+                        "optimizer":opt.state_dict(), 
+                        "scheduler":sched.state_dict()
+                        }, args.out)
             print(f"  -> saved new best checkpoint to {args.out}")
 
     print("Done. Best val MSE:", best_val)

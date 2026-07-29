@@ -126,8 +126,8 @@ def main():
         args.max_in_flight = max(4, args.workers * 4)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    train_path = f"{args.out_dir}/train.bin"
-    val_path = f"{args.out_dir}/val.bin"
+    train_path = f"{args.out_dir}/train1.bin"
+    val_path = f"{args.out_dir}/val1.bin"
 
     n_train_written = 0
     n_val_written = 0
