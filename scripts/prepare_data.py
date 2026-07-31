@@ -105,7 +105,7 @@ def main():
     ap.add_argument("--out-dir", default="../data")
     ap.add_argument("--n-train", type=int, default=8_000_000)
     ap.add_argument("--n-val", type=int, default=50_000)
-    ap.add_argument("--min-depth", type=int, default=10)
+    ap.add_argument("--min-depth", type=int, default=20)
     ap.add_argument("--max-abs-cp", type=int, default=1500)
     ap.add_argument("--keep-mate", action="store_true",
                      help="Include forced-mate rows (stored as +/-3000cp).")

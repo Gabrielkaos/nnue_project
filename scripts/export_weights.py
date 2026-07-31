@@ -146,7 +146,7 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     model = NNUE()
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     weights = {
