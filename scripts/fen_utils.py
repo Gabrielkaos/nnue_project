@@ -85,18 +85,16 @@ def fen_to_board_bytes(fen: str) -> bytes:
 
 
 def pack_record(fen: str, cp, mate) -> bytes:
-    """Pack a dataset row into a fixed 68-byte record.
-    cp: int or None. mate: int or None (plies to mate, sign = side that mates).
-    Eval is always stored from WHITE's perspective.
-    """
     board, stm = fen_to_board_and_stm(fen)
 
     if mate is not None:
         is_mate = 1
-        eval_cp = 3000 if mate > 0 else -3000
+        mate_cp = 3000 if mate > 0 else -3000
+        eval_cp = -mate_cp if stm == 1 else mate_cp   # mate is also stm-relative
     else:
         is_mate = 0
-        eval_cp = int(cp)
+        cp_stm = int(cp)
+        eval_cp = -cp_stm if stm == 1 else cp_stm      # <-- the fix
         if eval_cp > 3000:
             eval_cp = 3000
         elif eval_cp < -3000:
