@@ -48,8 +48,7 @@ checkpoint.
 
 Usage:
     python export_weights.py --checkpoint ../checkpoints/nnue.pt \
-        --out ../checkpoints/nnue.bin \
-        --qa-scale 128 --qb-scale 64 --qc-scale 64 --qd-scale 64
+        --out ../checkpoints/nnue.bin
 """
 
 import argparse
@@ -129,17 +128,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", default="../checkpoints/nnue.pt")
     ap.add_argument("--out", default="../checkpoints/nnue.bin")
-    ap.add_argument("--qa-scale", type=int, default=64,
+    ap.add_argument("--qa-scale", type=int, default=5478,
                      help="Feature-transformer fixed-point scale (weights go "
                           "into int16, so keep max|weight|*scale under 32767).")
-    ap.add_argument("--qb-scale", type=int, default=64,
+    ap.add_argument("--qb-scale", type=int, default=684,
                      help="fc2 fixed-point scale (weights go into int8, so "
                           "keep max|weight|*scale under 127 -- expect to "
                           "need a smaller value here than qa, e.g. 16-64).")
-    ap.add_argument("--qc-scale", type=int, default=64,
+    ap.add_argument("--qc-scale", type=int, default=126,
                      help="fc3 fixed-point scale (weights go into int8, "
                           "same headroom caveat as qb-scale).")
-    ap.add_argument("--qd-scale", type=int, default=64,
+    ap.add_argument("--qd-scale", type=int, default=82,
                      help="fc4/output fixed-point scale (weights go into "
                           "int8, same headroom caveat as qb-scale).")
     args = ap.parse_args()

@@ -2,7 +2,7 @@
 Train the NNUE model on the binary cache produced by prepare_data.py.
 
 Example:
-    python train.py --train ../data/train.bin --val ../data/val.bin \
+    python train.py --train ../data/train1.bin --val ../data/val1.bin \
         --epochs 20 --batch-size 8192 --lr 1e-3 --resume
 """
 

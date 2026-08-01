@@ -89,12 +89,11 @@ def pack_record(fen: str, cp, mate) -> bytes:
 
     if mate is not None:
         is_mate = 1
-        mate_cp = 3000 if mate > 0 else -3000
-        eval_cp = -mate_cp if stm == 1 else mate_cp   # mate is also stm-relative
+        # mate is White-relative too: positive = White mates.
+        eval_cp = 3000 if mate > 0 else -3000
     else:
         is_mate = 0
-        cp_stm = int(cp)
-        eval_cp = -cp_stm if stm == 1 else cp_stm      # <-- the fix
+        eval_cp = int(cp)  # already White-relative, no stm flip needed
         if eval_cp > 3000:
             eval_cp = 3000
         elif eval_cp < -3000:
