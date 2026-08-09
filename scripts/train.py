@@ -59,8 +59,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train", default="../data/train.bin")
-    ap.add_argument("--val", default="../data/val.bin")
+    ap.add_argument("--train", default="../data/train1.bin")
+    ap.add_argument("--val", default="../data/val1.bin")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=8192)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -103,6 +103,7 @@ def main():
     )
 
     model = NNUE().to(device)
+    print(f"model layers size{model.l1_size},{model.l2_size},{model.l3_size}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(
         opt, step_size=max(1, args.epochs // 4), gamma=0.3

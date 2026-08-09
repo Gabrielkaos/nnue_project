@@ -46,7 +46,7 @@ class ClippedReLU(nn.Module):
 
 
 class NNUE(nn.Module):
-    def __init__(self, num_features=NUM_FEATURES, l1=512, l2=64, l3=32):
+    def __init__(self, num_features=NUM_FEATURES, l1=1024, l2=128, l3=64):
         super().__init__()
         self.num_features = num_features
         self.l1_size = l1
